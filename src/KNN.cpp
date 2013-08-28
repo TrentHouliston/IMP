@@ -12,152 +12,92 @@ namespace isomap {
 
     std::tuple<arma::umat, arma::fmat> Isomap::knn(const arma::fmat& input, int k, float epsilon) {
 
-        bool chunking = false;
-
-        // Armadillo uses column major ordering, the matrix is expected to be transposed
-        size_t points = input.n_cols;
-        size_t dimensions = input.n_rows;
-
-        // Our output is a matrix of distances, and the corresponding indexes (transposed)
-        arma::fmat distances(k, points);
+        arma::umat indices(input.n_rows, k);
+        arma::fmat distances(input.n_rows, k);
         distances.fill(epsilon);
-        arma::umat indices(k, points);
 
-        // Check if we need to activate chunking mode (not enough space on the GPU for the operation
-        // Check if we can allocate enough memory for our input data (in one go)
-        chunking |= points * dimensions * sizeof(cl_float) > gpuDevice.getInfo<CL_DEVICE_MAX_MEM_ALLOC_SIZE>();
-        // Check if we can allocate enough memory for our index data (in one go)
-        chunking |= points * k * sizeof(cl_uint) > gpuDevice.getInfo<CL_DEVICE_MAX_MEM_ALLOC_SIZE>();
-        // Check if we can allocate enough memory for our distance data (in one go)
-        chunking |= points * k * sizeof(cl_float) > gpuDevice.getInfo<CL_DEVICE_MAX_MEM_ALLOC_SIZE>();
-        // Check if we have enough ram to hold it all at once
-        chunking |= (points * k * (sizeof(cl_float) + sizeof(cl_uint))) + points * dimensions * sizeof(cl_float) > gpuDevice.getInfo<CL_DEVICE_GLOBAL_MEM_SIZE>();
+        // Check if we need to chunk (we can't allocate our distances buffer all at once
+        bool chunking = gpuDevice.getInfo<CL_DEVICE_MAX_MEM_ALLOC_SIZE>() < input.n_rows * input.n_rows * sizeof(cl_float);
 
-        chunking = true;
-        // If we don't need to chunk (it will all fit on the gpu)
+        // If we are not chunking
         if(!chunking) {
-            // Allocate our buffers
-            cl::Buffer sourceBuffer(context, CL_MEM_READ_ONLY, sizeof(cl_float) * points * dimensions);
-            cl::Buffer indicesBuffer(context, CL_MEM_READ_WRITE, sizeof(cl_uint) * points * k);
-            cl::Buffer distancesBuffer(context, CL_MEM_READ_WRITE, sizeof(cl_float) * points * k);
+            
+            cl::Buffer distanceMatrixBuffer(context, CL_MEM_READ_WRITE, sizeof(cl_float) * input.n_rows * input.n_rows);
+            gpuQueue.enqueueFillBuffer(distanceMatrixBuffer, 0, 0, input.n_rows * input.n_rows * sizeof(cl_float));
 
-            // Copy our source to the buffer
-            gpuQueue.enqueueWriteBuffer(sourceBuffer, CL_TRUE, 0, sizeof(cl_float) * points * dimensions, input.memptr());
-            // Copy our distances to the buffer (no need to write indexes)
-            gpuQueue.enqueueWriteBuffer(distancesBuffer, CL_TRUE, 0, sizeof(cl_float) * points * k, distances.memptr());
+            cl::Buffer colBuffer(context, CL_MEM_READ_ONLY, sizeof(cl_float) * input.n_rows);
 
-            // Run the kernel
-            executeKernel(CL_DEVICE_TYPE_GPU, "knn", points, sourceBuffer, sourceBuffer, points, dimensions, indicesBuffer, distancesBuffer, k, epsilon, 0, 0);
+            for(int i = 0; i < input.n_cols; ++i) {
+                gpuQueue.enqueueWriteBuffer(colBuffer, CL_TRUE, 0, sizeof(cl_float) * input.n_rows, input.colptr(i));
 
-            // Copy our data out of the gpu and into our result
-            gpuQueue.enqueueReadBuffer(distancesBuffer, CL_TRUE, 0, sizeof(cl_float) * points * k, distances.memptr());
-            gpuQueue.enqueueReadBuffer(indicesBuffer, CL_TRUE, 0, sizeof(cl_uint) * points * k, indices.memptr());
+                executeKernel(CL_DEVICE_TYPE_GPU, "sumColumn", input.n_rows * input.n_rows, distanceMatrixBuffer, colBuffer, cl_ulong(input.n_cols), cl_ulong(0)).wait();
+            }
+
+            executeKernel(CL_DEVICE_TYPE_GPU, "squareRoot", input.n_rows * input.n_rows, distanceMatrixBuffer).wait();
+
+            arma::fmat distanceMatrix(input.n_rows, input.n_rows);
+            gpuQueue.enqueueReadBuffer(distanceMatrixBuffer, CL_TRUE, 0, sizeof(cl_float) * input.n_rows * input.n_rows, distanceMatrix.memptr());
+
+            // Here we map a cpu host pointer (since we are using the cpu)
+            cl::Buffer cpuDistMatrixBuffer(context, CL_MEM_READ_ONLY | CL_MEM_USE_HOST_PTR, sizeof(cl_float) * input.n_rows * input.n_rows, distanceMatrix.memptr());
+            cl::Buffer indicesBuffer(context, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, sizeof(cl_uint) * input.n_rows * input.n_rows, indices.memptr());
+            cl::Buffer distancesBuffer(context, CL_MEM_READ_WRITE | CL_MEM_USE_HOST_PTR, sizeof(cl_float) * input.n_rows * input.n_rows, distances.memptr());
+
+            // Map our buffers to opencl so the CPU opencl can search them
+            gpuQueue.enqueueMapBuffer(cpuDistMatrixBuffer, CL_TRUE, CL_MAP_WRITE, 0, sizeof(cl_float) * input.n_rows * input.n_rows);
+            gpuQueue.enqueueMapBuffer(indicesBuffer, CL_TRUE, CL_MAP_WRITE, 0, sizeof(cl_uint) * input.n_rows);
+            gpuQueue.enqueueMapBuffer(distancesBuffer, CL_TRUE, CL_MAP_WRITE, 0, sizeof(cl_float) * input.n_rows);
+
+            // Find our k Nearest elements
+            executeKernel(CL_DEVICE_TYPE_GPU, "findKNearest", input.n_rows, cpuDistMatrixBuffer, indicesBuffer, distancesBuffer, cl_ulong(k)).wait();
+
+            // Make sure all our data is back on the device
+            gpuQueue.enqueueMapBuffer(indicesBuffer, CL_TRUE, CL_MAP_READ, 0, sizeof(cl_uint) * input.n_rows);
+            gpuQueue.enqueueMapBuffer(distancesBuffer, CL_TRUE, CL_MAP_READ, 0, sizeof(cl_float) * input.n_rows);
         }
         else {
-            // Find which of the 3 buffers takes up the largest allocation and find it's limit
-            size_t numChunks = 0;
-            size_t chunkSize;
+            // Check if we need to go into Superchunk mode (we can't even fit a single column of data in an allocation
+            bool superchunk = gpuDevice.getInfo<CL_DEVICE_MAX_MEM_ALLOC_SIZE>() > sizeof(cl_float) * input.n_rows;
 
-            size_t minDistanceAlloc((k * sizeof(cl_float)) / gpuDevice.getInfo<CL_DEVICE_MAX_MEM_ALLOC_SIZE>());
-            size_t minIndexAlloc((k * sizeof(cl_uint)) / gpuDevice.getInfo<CL_DEVICE_MAX_MEM_ALLOC_SIZE>());
-            size_t minInputAlloc((dimensions * sizeof(cl_float)) / gpuDevice.getInfo<CL_DEVICE_MAX_MEM_ALLOC_SIZE>());
-            size_t minOnChip((dimensions * sizeof(cl_float) + k * (sizeof(cl_float) + sizeof(cl_uint))) / gpuDevice.getInfo<CL_DEVICE_GLOBAL_MEM_SIZE>());
+            if(!superchunk) {
 
-            numChunks = minDistanceAlloc > numChunks ? minDistanceAlloc : numChunks;
-            numChunks = minIndexAlloc    > numChunks ? minIndexAlloc    : numChunks;
-            numChunks = minInputAlloc    > numChunks ? minInputAlloc    : numChunks;
-            numChunks = minOnChip        > numChunks ? minOnChip        : numChunks;
+                // Work out a good chunk size (that will fit the entireity of a row)
+                size_t chunkSize = gpuDevice.getInfo<CL_DEVICE_MAX_MEM_ALLOC_SIZE>() / (sizeof(cl_float) * input.n_rows);
+                size_t numChunks = (input.n_rows * input.n_rows) / chunkSize; // TODO if it does not evenly divide, add one
 
-            // We have to add one more chunk (integer math rounds down)
-            numChunks++;
+                // Allocate and fill our buffer
+                cl::Buffer distanceMatrixBuffer(context, CL_MEM_READ_WRITE, sizeof(cl_float) * chunkSize);
+                gpuQueue.enqueueFillBuffer(distanceMatrixBuffer, 0, 0, sizeof(cl_float) * chunkSize);
 
-            numChunks = 20;
+                for (size_t i = 0; i < numChunks; ++i) {
+                    // Fill the distanceMatrixBuffer with 0s
 
-            // Work out how big each chunk is
-            chunkSize = points / numChunks;
+                    for (size_t j = 0; j < input.n_cols; ++j) {
+                        // Load and sum the column into the distanceMatrixBuffer
 
-            // Work out if we need another chunk (odd number of points)
-            chunkSize = chunkSize * numChunks >= points ? chunkSize : chunkSize + 1;
-
-            // Allocate our buffers
-            cl::Buffer sourceInputBuffer(context, CL_MEM_READ_WRITE, sizeof(cl_float) * chunkSize * dimensions);
-            cl::Buffer sourceIndicesBuffer(context, CL_MEM_READ_WRITE, sizeof(cl_uint) * chunkSize * k);
-            cl::Buffer sourceDistancesBuffer(context, CL_MEM_READ_WRITE, sizeof(cl_float) * chunkSize * k);
-            cl::Buffer targetInputBuffer(context, CL_MEM_READ_WRITE, sizeof(cl_float) * chunkSize * dimensions);
-            cl::Buffer targetIndicesBuffer(context, CL_MEM_READ_WRITE, sizeof(cl_uint) * chunkSize * k);
-            cl::Buffer targetDistancesBuffer(context, CL_MEM_READ_WRITE, sizeof(cl_float) * chunkSize * k);
-
-            for (int i = 0; i < numChunks; ++i) {
-
-                // Work out how much data we actually have
-                size_t sourceSize = chunkSize < points - i ? chunkSize : points - i;
-
-                // Copy our data into these buffers
-                gpuQueue.enqueueWriteBuffer(sourceInputBuffer, CL_TRUE, 0, sizeof(cl_float) * sourceSize * dimensions, input.colptr(i * chunkSize));
-                gpuQueue.enqueueWriteBuffer(sourceDistancesBuffer, CL_TRUE, 0, sizeof(cl_float) * sourceSize * k, distances.colptr(i * chunkSize));
-
-                for (int j = i; j < numChunks; ++j) {
-                    // Find out how many datapoints we have
-                    size_t targetSize = chunkSize < points - j ? chunkSize : points - j;
-
-                    if(i != j) {
-                        // Copy our data to the buffer
-                        gpuQueue.enqueueWriteBuffer(targetInputBuffer, CL_TRUE, 0, sizeof(cl_float) * targetSize * dimensions, input.colptr(j * chunkSize));
-                        gpuQueue.enqueueWriteBuffer(targetDistancesBuffer, CL_TRUE, 0, sizeof(cl_float) * targetSize * k, distances.colptr(j * chunkSize));
-
-                        executeKernel(CL_DEVICE_TYPE_GPU, "knn", sourceSize,
-                                      sourceInputBuffer,
-                                      targetInputBuffer,
-                                      targetSize,
-                                      dimensions,
-                                      sourceIndicesBuffer,
-                                      sourceDistancesBuffer,
-                                      k,
-                                      epsilon,
-                                      i * chunkSize,
-                                      j * chunkSize);
-
-                        gpuQueue.enqueueReadBuffer(sourceIndicesBuffer, CL_TRUE, 0, sizeof(cl_uint) * sourceSize * k, indices.colptr(i * chunkSize));
-                        gpuQueue.enqueueReadBuffer(sourceDistancesBuffer, CL_TRUE, 0, sizeof(cl_float) * sourceSize * k, distances.colptr(i * chunkSize));
-
-                        // Swap our buffers, so we can leave them on the GPU in the meantime (save transfer)
-                        executeKernel(CL_DEVICE_TYPE_GPU, "knn", targetSize,
-                                      targetInputBuffer,
-                                      sourceInputBuffer,
-                                      sourceSize,
-                                      dimensions,
-                                      targetIndicesBuffer,
-                                      targetDistancesBuffer,
-                                      k,
-                                      epsilon,
-                                      j * chunkSize,
-                                      i * chunkSize);
-
-                        gpuQueue.enqueueReadBuffer(targetIndicesBuffer, CL_TRUE, 0, sizeof(cl_uint) * targetSize * k, indices.colptr(j * chunkSize));
-                        gpuQueue.enqueueReadBuffer(targetDistancesBuffer, CL_TRUE, 0, sizeof(cl_float) * targetSize * k, distances.colptr(j * chunkSize));
+                        // Execute the kernel
                     }
-                    else {
-                        // If we are running against ourself, then we can use the same buffer twice
-                        executeKernel(CL_DEVICE_TYPE_GPU, "knn", sourceSize,
-                                      sourceInputBuffer,
-                                      sourceInputBuffer,
-                                      chunkSize,
-                                      dimensions,
-                                      sourceIndicesBuffer,
-                                      sourceDistancesBuffer,
-                                      k,
-                                      epsilon,
-                                      i * chunkSize,
-                                      i * chunkSize);
 
-                        // Copy our data out and back from the OpenCL device
-                        gpuQueue.enqueueReadBuffer(sourceIndicesBuffer, CL_TRUE, 0, sizeof(cl_uint), indices.colptr(i * chunkSize));
-                        gpuQueue.enqueueReadBuffer(sourceDistancesBuffer, CL_TRUE, 0, sizeof(cl_float), distances.colptr(i * chunkSize));
-                    }
-                    
+                    // Save the distanceMatrixBuffer back into our in memory buffer
                 }
+
+                // Do the same as the unchunked version (find K Nearest)
+                
+
+
+                // Allocate a section of our total distance matrix buffer (a whole number of rows)
+                // Populate this section of the distance matrix
+                // Pass the distance matrix to the CPU for finding kmax
+
+                // Allocate the next section of our total distance matrix buffer
+                // Populate this section of the distance matrix
+                // Pass this new distance matrix to the CPU for finding kmax
+            }
+            else {
+                // Damn this is going to be painful... How much data did you want!
             }
         }
+
 
         return { indices, distances };
 

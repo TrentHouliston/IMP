@@ -11,10 +11,6 @@
 namespace isomap {
     std::string Isomap::readKernel(const char* path) {
 
-        char cCurrentPath[FILENAME_MAX];
-
-        std::cout << getcwd(cCurrentPath, sizeof(cCurrentPath)) << std::endl;
-
         std::ifstream in(path, std::ios::in | std::ios::binary);
         if (in)
         {
@@ -58,7 +54,7 @@ namespace isomap {
         // Tell the user what Device we are using
         std::cout<< "Using CPU OpenCL device:  " << cpuDevice.getInfo<CL_DEVICE_NAME>() << std::endl;
         std::cout << "\tLargest Single Buffer: " << cpuDevice.getInfo<CL_DEVICE_MAX_MEM_ALLOC_SIZE>() / 1048576 << "mb" << std::endl;
-        std::cout << "\tGlobal Memory Size:    " << cpuDevice.getInfo<CL_DEVICE_GLOBAL_MEM_SIZE>() / 1048576 << "mb" << std::endl;
+        std::cout << "\tGlobal Memory Size:    " << cpuDevice.getInfo<CL_DEVICE_GLOBAL_MEM_SIZE>() / 1048576 << "mb" << std::endl << std::endl;
         // Tell the user what Device we are using
         std::cout<< "Using GPU OpenCL device:  " << gpuDevice.getInfo<CL_DEVICE_NAME>() << std::endl;
         std::cout << "\tLargest Single Buffer: " << gpuDevice.getInfo<CL_DEVICE_MAX_MEM_ALLOC_SIZE>() / 1048576 << "mb" << std::endl;
@@ -80,7 +76,7 @@ namespace isomap {
         sources.push_back({knnKernel.c_str(), knnKernel.size()});
 
         program = cl::Program(context, sources);
-        if(program.build({gpuDevice, cpuDevice}) != CL_SUCCESS) {
+        if(program.build({gpuDevice, cpuDevice}, "-g") != CL_SUCCESS) {
             std::stringstream message;
             message << "There was an error building the OpenCL code" << std::endl
             << "Build Log CPU:" << std::endl

@@ -1,74 +1,55 @@
-// K nearest Neighbours
+kernel void sumColumn(global float* distances,
+                      global const float* column,
+                      const ulong dimensions,
+                      const ulong offset) {
 
-/**
- * This kernel calculates the K nearest neighbours for the input matrix by chunking it into individual sections.
- * This allows the GPU to do a KNN on datasets that are larger then the amount of memory on the device. It is to
- * be called by splitting the input data into "Chunks" that fit on the gpu memory, and alternate them until every
- * chunk has been loaded as both source and dest. This results in a complete KNN map for all of the data.
- *
- * @param source        Our "Source" chunk of data to do KNN on
- * @param target        Our "Target" chunk, the chunk we are comparing distances to
- * @param targetSize    Our "Target" chunk size (the number of rows)
- * @param indices       The indexes to the nearest k neighbours (matches with distances)
- * @param distances     The distances to our nearest k neighbours (matches with indices)
- * @param kMax          The number of nodes to include in our K nearest
- * @param epsilon       Our epsilon to limit the distance of KMeans by
- * @param sourceOffset  The offset from 0 that the real (non chunked) index of our source is
- * @param targetOffset  The offset from 0 that the real (non chunked) index of our target is
- *
- * @author Josiah Walker
- * @author Trent Houliston
- */
-kernel void knn(global const float* source,
-                global const float* target,
-                const unsigned int targetSize,
-                const unsigned int dimensions,
-                global unsigned int* indices,
-                global float* distances,
-                const unsigned int kMax,
-                const float epsilon,
-                const unsigned int sourceOffset,
-                const unsigned int targetOffset) {
+    size_t index = get_global_id(0);
+    float distance = column[(index + offset) / dimensions] - column[(index + offset) % dimensions];
 
-    // Get where we are working
-    const size_t sourceBegin = get_global_id(0) * dimensions;
-    const size_t sourceAddress = get_global_id(0) * kMax;
+    distances[index] += distance * distance;
+}
 
-    // Check the distance for all of the points in our target chunk
-    for (unsigned int i = 0; i < targetSize; i++) {
+kernel void squareRoot(global float* values) {
 
-        // Calculating the distance from our source point to our target point
-        float distance = 0.0;
-        for (unsigned int j = 0; j < dimensions; j++) {
-            
-            float value = target[i * dimensions + j] - source[sourceBegin + j];
-            distance += value * value;
-        }
-        distance = sqrt(distance);
+    // Square root everything
+    values[get_global_id(0)] = sqrt(values[get_global_id(0)]);
+}
 
+kernel void findKNearest(const global float* input,
+                         global uint* indices,
+                         global float* distances,
+                         const ulong k) {
 
-        // Check if we are one of the K nearest (the nearest neighbours are sorted)
-        if (distance <= distances[sourceAddress + kMax - 1]
-            // Check we are not greater then epsilon
-            && distance < epsilon
-            // Check we are not looking at ourself
-            && (i + targetOffset) != (get_global_id(0) + sourceOffset)) {
+    size_t startMat = get_global_id(0) * get_global_size(0);
+    size_t endMat = (get_global_id(0) + 1) * get_global_size(0);
 
-            // Find where we fit in in the list of nearests
-            unsigned int j = 0;
-            while (distance > distances[sourceAddress + j]) {
-                j++;
+    size_t startK = get_global_id(0) * k;
+    size_t endK = (get_global_id(0) + 1) * k;
+
+    size_t ourself = startMat + get_global_id(0);
+
+    for (size_t i = startMat; i < endMat; ++i) {
+
+        // Check if our distance smaller then the largest distance
+        if(input[i] < distances[startK]
+           // Check we are not looking at our own entry
+           && i != ourself) {
+
+            // Find where we fit in the collection
+            size_t us = startK;
+            for(size_t j = startK; j < endK; ++j) {
+                us = input[i] < distances[j] ? j : us;
             }
 
-            // Shuffle all our data along to make room
-            for (unsigned int k = kMax - 1; k > j; k--) {
-                distances[sourceAddress + k] = distances[sourceAddress + k - 1];
-                indices[sourceAddress + k] = indices[sourceAddress + k - 1];
+            // Shuffle our data back
+            for(size_t j = us + 1; j > startK; --j) {
+                indices[j - 1] = indices[j];
+                distances[j - 1] = distances[j];
             }
 
-            // Add our new nearest point into it's rightful place
-            distances[sourceAddress + j] = distance;
-            indices[sourceAddress + j] = targetOffset + i;
+            // Insert ourself
+            distances[us] = input[i];
+            indices[us] = i;
         }
     }
 }
